@@ -5,10 +5,13 @@ A system that uses specialized agents to generate comprehensive radiology report
 
 import json
 import os
+import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 import google.generativeai as genai
 import re
+import asyncio
+
 
 
 @dataclass
@@ -34,27 +37,60 @@ class BaseAgent:
     def __init__(self, api_key: str):
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.5-flash')
+        self.max_retries = 5
+        self.initial_delay = 1
     
-    def generate_response(self, prompt: str, system_prompt: str = "") -> str:
+    async def generate_response_async(self, prompt: str, system_prompt: str = "") -> str:
         """Generate response using Gemini API"""
         # Combine system prompt with user prompt
         full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
         
-        response = self.model.generate_content(
-            full_prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0,
-                max_output_tokens=5000,
-            ),
-            safety_settings={
-                    'HARM_CATEGORY_HARASSMENT': 'block_none',
-                    'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-                    'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-                    'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'
-            }
+        for attempt in range(self.max_retries):
+            try:
+                response = await asyncio.to_thread(
+                    self.model.generate_content,
+                    full_prompt,
+                    generation_config=genai.GenerationConfig(
+                        temperature=0,
+                        max_output_tokens=5000,
+                    )
+                )
+                return response.text
+            
+            except Exception as e:
+                error_str = str(e).lower()
+
+                if '429' in error_str or 'quota' in error_str or 'rate limit' in error_str or 'resource exhausted' in error_str:
+                    if attempt < self.max_retries - 1:
+                        delay = self.initial_delay * (2 ** attempt)
+                        print(f"⚠️  Rate limit hit. Retrying in {delay} seconds... (attempt {attempt + 1}/{self.max_retries})")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        print(f"❌ Rate limit exceeded after {self.max_retries} attempts")
+                        return "Unable to generate report due to rate limiting. Please try again later."
                 
-        )
-        return response.text
+                elif 'timeout' in error_str or 'connection' in error_str or 'unavailable' in error_str:
+                    if attempt < self.max_retries - 1:
+                        delay = self.initial_delay * (2 ** attempt)
+                        print(f"⚠️  API error ({error_str[:50]}...). Retrying in {delay} seconds...")
+                        await asyncio.sleep(delay)
+                        continue
+                
+                # Handle ValueError (finish_reason issues)
+                if isinstance(e, ValueError) and "finish_reason" in error_str:
+                    return "No significant abnormality detected based on the provided findings."
+                
+                # For non-retryable errors
+                print(f"Warning: Error generating response - {str(e)}")
+                return "Unable to process findings. Please review input data."
+        
+        # If we exhausted all retries
+        return "Unable to generate report after multiple attempts. Please try again later."
+    
+    def generate_response(self, prompt: str, system_prompt: str = "") -> str:
+        """Synchronous wrapper for generate_response"""
+        return asyncio.run(self.generate_response_async(prompt, system_prompt))
 
 
 class SplitterAgent(BaseAgent):
@@ -79,7 +115,7 @@ For "others", return a list of objects with "organ" and "findings" keys.
 If a section says "NP" or is empty, include it as is.
 Preserve all measurements and details exactly as written."""
     
-    def split(self, patient_data: str) -> PatientInfo:
+    async def split(self, patient_data: str) -> PatientInfo:
         """Split patient data into structured format"""
         prompt = f"""Parse this radiology patient information and extract data by body part:
 
@@ -87,7 +123,7 @@ Preserve all measurements and details exactly as written."""
 
 Return a JSON object with the structure specified in your system prompt."""
         
-        response = self.generate_response(prompt, self.system_prompt)
+        response = await self.generate_response_async(prompt, self.system_prompt)
         
         # Extract JSON from response
         json_match = re.search(r'\{.*\}', response, re.DOTALL)
@@ -171,15 +207,7 @@ When you receive the structured input, produce **only** the liver report paragra
 
 """
 
-    def generate_report(self, findings: str) -> str:
-        """Generate liver report section"""
-        prompt = f"""Generate a radiology report section for the liver based on these findings:
 
-{findings}
-
-Provide only the report text, no headers or labels."""
-        
-        return self.generate_response(prompt, self.system_prompt)
 
 
 class GallbladderAgent(BaseAgent):
@@ -228,15 +256,6 @@ class GallbladderAgent(BaseAgent):
 
 """
 
-    def generate_report(self, findings: str) -> str:
-        """Generate gallbladder and biliary system report section"""
-        prompt = f"""Generate a radiology report section for the gallbladder and biliary system based on these findings:
-
-{findings}
-
-Provide only the report text, no headers or labels."""
-        
-        return self.generate_response(prompt, self.system_prompt)
 
 
 class PancreasAgent(BaseAgent):
@@ -278,15 +297,6 @@ class PancreasAgent(BaseAgent):
 --- FINAL INSTRUCTION (must be followed exactly)
 When you receive the structured input, produce only the pancreas report paragraph(s) adhering to the rules above. Do not output anything else — no commentary, no bullet lists, no extra whitespace lines, and no surrounding quotes."""
 
-    def generate_report(self, findings: str) -> str:
-        """Generate pancreas report section"""
-        prompt = f"""Generate a radiology report section for the pancreas based on these findings:
-
-{findings}
-
-Provide only the report text, no headers or labels."""
-        
-        return self.generate_response(prompt, self.system_prompt)
 
 
 class SpleenAgent(BaseAgent):
@@ -328,15 +338,6 @@ class SpleenAgent(BaseAgent):
 When you receive the structured input, produce only the spleen report paragraph(s) adhering to the rules above. Do not output anything else — no commentary, no bullet lists, no extra whitespace lines, and no surrounding quotes.
 """
 
-    def generate_report(self, findings: str) -> str:
-        """Generate spleen report section"""
-        prompt = f"""Generate a radiology report section for the spleen based on these findings:
-
-{findings}
-
-Provide only the report text, no headers or labels."""
-        
-        return self.generate_response(prompt, self.system_prompt)
 
 
 class KidneyAgent(BaseAgent):
@@ -392,15 +393,6 @@ IMPORTANT: MP in input must be reported as "interpolar region" — do not output
 --- FINAL INSTRUCTION (must be followed exactly)
 When you receive the structured input, produce only the kidney report paragraph(s) adhering to the rules above. Do not output anything else — no commentary, no bullet lists, no extra whitespace lines, and no surrounding quotes."""
 
-    def generate_report(self, findings: str) -> str:
-        """Generate kidneys report section"""
-        prompt = f"""Generate a radiology report section for the kidneys based on these findings:
-
-{findings}
-
-Provide only the report text, no headers or labels."""
-        
-        return self.generate_response(prompt, self.system_prompt)
 
 
 class AortaAgent(BaseAgent):
@@ -449,17 +441,6 @@ class AortaAgent(BaseAgent):
 --- FINAL INSTRUCTION (must be followed exactly)
 When you receive the structured input, produce only the abdominal aorta report paragraph(s) adhering to the rules above. Do not output anything else — no commentary, no bullet lists, no extra whitespace lines, and no surrounding quotes.
 """
-
-    def generate_report(self, findings: str) -> str:
-        """Generate aorta report section"""
-        prompt = f"""Generate a radiology report section for the aorta based on these findings:
-
-{findings}
-Only analyse the part of the comment section that is relevant to aorta findings:
-
-Provide only the report text, no headers or labels."""
-        
-        return self.generate_response(prompt, self.system_prompt)
 
 
 class OthersAgent(BaseAgent):
@@ -522,19 +503,6 @@ Generate professional, concise radiology report sections.
 When you receive the structured input, produce only the report paragraph(s) for that organ/region adhering to the rules above. Do not output anything else — no commentary, no bullet lists, no extra whitespace lines, and no surrounding quotes.
 """
 
-    def generate_report(self, organ_name: str, findings: str, comment: str) -> str:
-        """Generate report section for a non-standard organ"""
-        prompt = f"""Generate a radiology report section for {organ_name} based on these findings:
-
-{findings}
-Additional Comments: - Look at the part of the additional comments section that is relevant to {organ_name} findings:
-{comment}
-
-
-Provide only the report text."""
-        
-        return self.generate_response(prompt, self.system_prompt)
-
 
 class ImpressionAgent(BaseAgent):
     """Agent that generates the impression/summary"""
@@ -544,26 +512,13 @@ class ImpressionAgent(BaseAgent):
         self.system_prompt = """You are a radiologist creating the IMPRESSION section of a radiology report.
 
 The impression should:
-- Summarize the most significant findings (do not extrapolate, just refer to the information in the report)
-- List pathological findings in order of clinical importance
-- Be concise and clear
+- Summarize the most significant findings
+- Do not use your own words
+- Be concise and clear (no need for excessive detail)
 - For multiple findings, separate with next lines (do not use numbered list or bullet points)
-- If no significant findings, state "Unremarkable ultrasound study."
+- If no significant findings at all, only output "Unremarkable ultrasound study."
 - Focus on clinically relevant information (no recommendations or management advice or extraneous details)"""
     
-    def generate_impression(self, full_report: str, original_comment: str = "") -> str:
-        """Generate impression from full report"""
-        prompt = f"""Based on this complete radiology report, generate a professional IMPRESSION section:
-
-REPORT:
-{full_report}
-
-ORIGINAL COMMENT:
-{original_comment}
-
-Provide only the impression text, no headers."""
-        
-        return self.generate_response(prompt, self.system_prompt)
 
 
 class CentralAgent:
@@ -583,7 +538,7 @@ class CentralAgent:
         self.others_agent = OthersAgent(api_key)
         self.impression_agent = ImpressionAgent(api_key)
     
-    def process_patient(self, patient_data: str) -> str:
+    async def process_patient_async(self, patient_data: str) -> str:
         """Process patient data and generate complete report"""
         print("\n" + "="*80)
         print("PROCESSING PATIENT")
@@ -591,48 +546,99 @@ class CentralAgent:
         
         # Step 1: Split data by body part
         print("\n[1] Splitting patient data by body part...")
-        patient_info = self.splitter.split(patient_data)
+        patient_info = await self.splitter.split(patient_data)
         print(f"✓ Data extracted for: Liver, GB, Pancreas, Spleen, Kidney, Aorta, Others, Comment")
         
         # Step 2: Generate reports for each organ in order
-        print("\n[2] Generating organ-specific reports...")
-        report_sections = []
+        print("\n[2] Generating organ-specific reports PARALLELLY...")
+        
+        tasks = []
         
         # Liver
         if patient_info.liver and patient_info.liver.strip():
             print("  → Generating Liver report...")
-            liver_report = self.liver_agent.generate_report(patient_info.liver)
-            report_sections.append(f"{liver_report}")
+            prompt = f"""Generate a radiology report section for the liver based on these findings:
+
+{patient_info.liver}
+
+Provide only the report text, no headers or labels."""
+            tasks.append(self.liver_agent.generate_response_async(
+                prompt,
+                self.liver_agent.system_prompt 
+            ))
         
         # Gallbladder
         if patient_info.gb and patient_info.gb.strip():
             print("  → Generating Gallbladder report...")
-            gb_report = self.gb_agent.generate_report(patient_info.gb)
-            report_sections.append(f"{gb_report}")
-        
+            prompt = f"""Generate a radiology report section for the gallbladder and biliary system based on these findings:
+
+{patient_info.gb}
+
+Provide only the report text, no headers or labels."""
+            tasks.append(self.gb_agent.generate_response_async(
+                prompt,
+                self.gb_agent.system_prompt
+            ))
+
         # Pancreas
         if patient_info.pancreas and patient_info.pancreas.strip():
             print("  → Generating Pancreas report...")
-            pancreas_report = self.pancreas_agent.generate_report(patient_info.pancreas)
-            report_sections.append(f"{pancreas_report}")
-        
+            prompt = f"""Generate a radiology report section for the pancreas based on these findings:
+
+{patient_info.pancreas}
+
+Provide only the report text, no headers or labels."""
+            tasks.append(self.pancreas_agent.generate_response_async(
+                prompt,
+                self.pancreas_agent.system_prompt
+            ))
+
         # Spleen
         if patient_info.spleen and patient_info.spleen.strip():
             print("  → Generating Spleen report...")
-            spleen_report = self.spleen_agent.generate_report(patient_info.spleen)
-            report_sections.append(f"{spleen_report}")
-        
+            prompt = f"""Generate a radiology report section for the spleen based on these findings:
+
+{patient_info.spleen}
+
+Provide only the report text, no headers or labels."""
+            tasks.append(self.spleen_agent.generate_response_async(
+                prompt,
+                self.spleen_agent.system_prompt
+            ))
+
         # Kidneys
         if patient_info.kidney and patient_info.kidney.strip():
             print("  → Generating Kidney report...")
-            kidney_report = self.kidney_agent.generate_report(patient_info.kidney)
-            report_sections.append(f"{kidney_report}")
-        
+            prompt = f"""Generate a radiology report section for the kidneys based on these findings:
+
+{patient_info.kidney}
+
+Provide only the report text, no headers or labels."""
+            tasks.append(self.kidney_agent.generate_response_async(
+                prompt,
+                self.kidney_agent.system_prompt
+            ))
+
         # Aorta
         if patient_info.aorta and patient_info.aorta.strip():
             print("  → Generating Aorta report...")
-            aorta_report = self.aorta_agent.generate_report(patient_info.aorta)
-            report_sections.append(f"{aorta_report}")
+            prompt = f"""Generate a radiology report section for the aorta based on these findings:
+
+{patient_info.aorta}
+
+Provide only the report text, no headers or labels."""
+            tasks.append(self.aorta_agent.generate_response_async(
+                prompt,
+                self.aorta_agent.system_prompt
+            ))
+
+        # Await all organ report tasks
+        print(f"\n  ⚡ Processing {len(tasks)} organs in parallel...")
+        start_time = time.time()
+        organ_reports = await asyncio.gather(*tasks)
+        elapsed = time.time() - start_time
+        print(f"  ✓ All organ reports generated in {elapsed:.2f} seconds.")
+
         
         # Others - process each non-standard organ
         if patient_info.others:
@@ -641,18 +647,37 @@ class CentralAgent:
                 findings = other_organ.get("findings", "")
                 if findings and findings.strip():
                     print(f"  → Generating {organ_name} report...")
-                    other_report = self.others_agent.generate_report(organ_name, findings, patient_info.comment)
-                    report_sections.append(f"{other_report}")
+                    prompt = f"""Generate a radiology report section for {organ_name} based on these findings:
 
+{findings}
+Additional Comments: - Look at the part of the additional comments section that is relevant to {organ_name} findings:
+{patient_info.comment}
+
+
+Provide only the report text."""
+                    other_report = await self.others_agent.generate_response_async(
+                        prompt,
+                        self.others_agent.system_prompt
+                    )
+                    organ_reports.append(other_report)
         # Step 3: Combine all sections
         print("\n[3] Combining report sections...")
-        full_report = "\n\n".join(report_sections)
-        
+        full_report = "\n\n".join(organ_reports)
+
         # Step 4: Generate impression
         print("\n[4] Generating impression...")
-        impression = self.impression_agent.generate_impression(
-            full_report, 
-            patient_info.comment
+        prompt = f"""Based on this complete radiology report, generate a professional IMPRESSION section:
+
+REPORT:
+{full_report}
+
+ORIGINAL COMMENT:
+{patient_info.comment}
+
+Provide only the impression text, no headers."""
+        impression = await self.impression_agent.generate_response_async(
+            prompt,
+            self.impression_agent.system_prompt
         )
         
         # Step 5: Create final report
@@ -677,22 +702,32 @@ class RadiologyReportGenerator:
         self.central_agent = CentralAgent(api_key)
         self.output_dir = "./output/"
     
-    def process_single_patient(self, patient_data: str) -> str:
-        """Process a single patient's data"""
-        return self.central_agent.process_patient(patient_data)
-    
-    def process_batch(self, patient_data_list: List[str], date: str) -> str:
-        """Process multiple patients for a specific date"""
+    async def process_batch_async(self, patient_data_list: List[str], date: str) -> str:
+        """Process multiple patients concurrently (FAST!)"""
         print(f"\n{'='*80}")
-        print(f"PROCESSING BATCH FOR DATE: {date}")
+        print(f"PROCESSING BATCH FOR DATE: {date} (ASYNC MODE)")
         print(f"Total patients: {len(patient_data_list)}")
         print(f"{'='*80}")
         
-        all_reports = []
+        # Process all patients concurrently
+        print(f"\n⚡ Processing {len(patient_data_list)} patients in parallel...")
+        start_time = time.time()
         
+        tasks = []
         for i, patient_data in enumerate(patient_data_list, 1):
-            print(f"\n\n### PATIENT {i} OF {len(patient_data_list)} ###")
-            report = self.process_single_patient(patient_data)
+            print(f"  • Queuing Patient {i}/{len(patient_data_list)}")
+            tasks.append(self.central_agent.process_patient_async(patient_data))
+        
+        # Execute all patients in parallel
+        reports = await asyncio.gather(*tasks)
+        elapsed = time.time() - start_time
+        
+        print(f"\n✓ All {len(patient_data_list)} patients processed in {elapsed:.2f} seconds!")
+        print(f"  Average: {elapsed/len(patient_data_list):.2f} seconds per patient")
+        
+        # Format reports
+        all_reports = []
+        for i, report in enumerate(reports, 1):
             all_reports.append(f"{'='*80}\nPATIENT {i}\n{'='*80}\n\n{report}")
         
         # Combine all reports
@@ -708,9 +743,15 @@ class RadiologyReportGenerator:
         print(f"\n\n{'='*80}")
         print(f"✓ BATCH PROCESSING COMPLETE")
         print(f"✓ All reports saved to: {output_file}")
+        print(f"✓ Total time: {elapsed:.2f} seconds")
         print(f"{'='*80}\n")
         
         return output_file
+    
+    def process_batch(self, patient_data_list: List[str], date: str) -> str:
+        """Process multiple patients for a specific date (sync wrapper)"""
+        return asyncio.run(self.process_batch_async(patient_data_list, date))
+
 
 
 def main():
@@ -731,17 +772,16 @@ def main():
     
     # Initialize generator
     generator = RadiologyReportGenerator(api_key)
+        
+
+    # Batch mode
+    date = input("\nEnter date (e.g., 2024-01-15): ").strip()
+    num_patients = int(input("How many patients? ").strip())
     
-    print("\nMODE SELECTION:")
-    print("1. Single Patient (paste data)")
-    print("2. Batch Processing (multiple patients)")
-    
-    mode = input("\nSelect mode (1 or 2): ").strip()
-    
-    if mode == "1":
-        # Single patient mode
-        print("\n" + "-"*80)
-        print("Paste patient data below (press Ctrl+D or Ctrl+Z when done):")
+    patient_data_list = []
+    for i in range(num_patients):
+        print(f"\n" + "-"*80)
+        print(f"Paste data for PATIENT {i+1} (press Ctrl+D or Ctrl+Z when done):")
         print("-"*80 + "\n")
         
         lines = []
@@ -753,54 +793,14 @@ def main():
             pass
         
         patient_data = "\n".join(lines)
-        
         if patient_data.strip():
-            report = generator.process_single_patient(patient_data)
-            
-            # Save report
-            output_file = os.path.join(generator.output_dir, "radiology_report_single.txt")
-            with open(output_file, 'w') as f:
-                f.write(report)
-            
-            print("\n" + "="*80)
-            print("GENERATED REPORT:")
-            print("="*80 + "\n")
-            print(report)
-            print(f"\n✓ Report saved to: {output_file}")
-        else:
-            print("No data provided!")
+            patient_data_list.append(patient_data)
     
-    elif mode == "2":
-        # Batch mode
-        date = input("\nEnter date (e.g., 2024-01-15): ").strip()
-        num_patients = int(input("How many patients? ").strip())
-        
-        patient_data_list = []
-        for i in range(num_patients):
-            print(f"\n" + "-"*80)
-            print(f"Paste data for PATIENT {i+1} (press Ctrl+D or Ctrl+Z when done):")
-            print("-"*80 + "\n")
-            
-            lines = []
-            try:
-                while True:
-                    line = input()
-                    lines.append(line)
-            except EOFError:
-                pass
-            
-            patient_data = "\n".join(lines)
-            if patient_data.strip():
-                patient_data_list.append(patient_data)
-        
-        if patient_data_list:
-            output_file = generator.process_batch(patient_data_list, date)
-            print(f"\n✓ All reports saved to: {output_file}")
-        else:
-            print("No patient data provided!")
-    
+    if patient_data_list:
+        output_file = generator.process_batch(patient_data_list, date)
+        print(f"\n✓ All reports saved to: {output_file}")
     else:
-        print("Invalid mode selection!")
+        print("No patient data provided!")
 
 
 if __name__ == "__main__":
