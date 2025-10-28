@@ -11,8 +11,115 @@ from dataclasses import dataclass
 import google.generativeai as genai
 import re
 import asyncio
+import pdfquery
 
 
+def extract_number(filename):
+    """Extract number from filename for sorting"""
+    match = re.search(r'\d+', filename)
+    return int(match.group()) if match else 0
+
+
+def extract_ultrasound_type(text):
+    """Extract ultrasound type from text"""
+    if not text:
+        return "Abdomen"
+    
+    # Common ultrasound types
+    types_map = {
+        'abdomen': 'Abdomen',
+        'liver': 'Liver',
+        'kidney': 'Kidney',
+        'pelvis': 'Pelvis',
+        'thyroid': 'Thyroid',
+        'breast': 'Breast',
+        'obstetric': 'Obstetric',
+        'cardiac': 'Cardiac',
+        'vascular': 'Vascular',
+    }
+    
+    text_lower = text.lower()
+    for key, value in types_map.items():
+        if key in text_lower:
+            return value
+    
+    return text.strip() if text.strip() else "Abdomen"
+
+
+def read_pdfs_in_folder(folder_path):
+    """Read patient information from PDF files in a single folder"""
+    findings = {}
+    if not os.path.exists(folder_path):
+        print(f"Folder '{folder_path}' not found.")
+        return findings
+     
+    for file_name in sorted(os.listdir(folder_path), key=extract_number):
+        if file_name.endswith(".pdf"):
+            file_path = os.path.join(folder_path, file_name)
+            try:
+                pdf = pdfquery.PDFQuery(file_path)
+                pdf.load()
+                name = pdf.pq('LTTextLineHorizontal:overlaps_bbox("157.096, 670.611, 221.032, 679.611")').text()
+                examination_finding = pdf.pq('LTTextBoxHorizontal:overlaps_bbox("153.846, 153.361, 394.291, 442.861")').text()
+                ultrasound_type = extract_ultrasound_type(
+                    pdf.pq('LTTextLineHorizontal:overlaps_bbox("157.846, 580.611, 218.821, 589.611")').text()
+                )
+                 
+                # Merge findings and ultrasound types
+                if name in findings:
+                    findings[name].append({
+                        'examination_finding': examination_finding,
+                        'ultrasound_type': ultrasound_type
+                    })
+                else:
+                    findings[name] = [{
+                        'examination_finding': examination_finding,
+                        'ultrasound_type': ultrasound_type,
+                        'name': name
+                    }]
+            except Exception as e:
+                print(f"Error reading {file_name}: {e}")
+    return findings
+
+
+def process_date_folders(base_folder_path):
+    """
+    Process all date folders in the base folder.
+    Returns a dictionary mapping dates to patient findings.
+    """
+    date_findings = {}
+    
+    if not os.path.exists(base_folder_path):
+        print(f"Base folder '{base_folder_path}' not found.")
+        return date_findings
+    
+    # Get all subdirectories (date folders)
+    subdirs = []
+    for item in os.listdir(base_folder_path):
+        item_path = os.path.join(base_folder_path, item)
+        if os.path.isdir(item_path):
+            subdirs.append(item)
+    
+    # Sort date folders
+    subdirs.sort()
+    
+    print(f"\nFound {len(subdirs)} date folder(s): {', '.join(subdirs)}")
+    
+    for date_folder in subdirs:
+        date_folder_path = os.path.join(base_folder_path, date_folder)
+        print(f"\nProcessing date folder: {date_folder}")
+        
+        # Read PDFs from this date folder
+        findings = read_pdfs_in_folder(date_folder_path)
+        
+        if findings:
+            date_findings[date_folder] = findings
+            total_exams = sum(len(exams) for exams in findings.values())
+            print(f"  ✓ Found {len(findings)} patient(s) with {total_exams} examination(s)")
+        else:
+            print(f"  ⚠ No valid PDFs found in {date_folder}")
+    
+    return date_findings
 
 @dataclass
 class PatientInfo:
@@ -316,7 +423,7 @@ class SpleenAgent(BaseAgent):
 2. If present, one short sentence describing focal findings (accessory spleen(s) or other lesions) with measurements and qualifiers. When multiple accessory spleens are present, mention multiplicity and give the largest size if provided.
 3. If a comparison note indicates a previously reported lesion is not seen or unchanged, include a brief sentence: e.g. “The previously reported [lesion type] is not visualized in this study.” or “The previously reported [lesion type] is unchanged.”
 --- PHRASES & WORDING (use these concise or equivalent phrases)
-* Normal spleen: “The spleen appears normal.” or “The spleen is normal.”
+* Normal spleen: “The spleen is normal.”
 * Splenomegaly / enlarged: “The spleen is enlarged.” (include size if provided: “The spleen is enlarged, measuring X cm.”)
 * Accessory spleen: “An accessory spleen is noted, measuring A x B mm.” or “Multiple accessory spleens are noted, largest measuring A x B mm.”
 * Previously reported lesion absent/unchanged: “The previously reported [lesion type] is not visualized in this study.” / “The previously reported [lesion type] is unchanged.”
@@ -331,7 +438,7 @@ class SpleenAgent(BaseAgent):
 * Do not provide recommendations, follow-up instructions, or clinical advice.
 --- EDGE CASES
 * If only an accessory spleen is provided with otherwise normal spleen: “The spleen is normal. An accessory spleen is noted, measuring A x B mm.”
-* If only a spleen size is provided and it is within normal range but no other tags: output “The spleen appears normal.” and include the size only if the reporting convention requires it.
+* If only a spleen size is provided and it is within normal range but no other tags: output “The spleen is normal.” and include the size only if the reporting convention requires it.
 * If multiple accessory spleens are present without sizes: “Multiple accessory spleens are noted.”
 * If a lesion is described as previously reported but not visualized: include the absent sentence and still report baseline spleen appearance.
 --- FINAL INSTRUCTION (must be followed exactly)
@@ -512,12 +619,21 @@ class ImpressionAgent(BaseAgent):
         self.system_prompt = """You are a radiologist creating the IMPRESSION section of a radiology report.
 
 The impression should:
-- Summarize the most significant findings
-- Do not use your own words
-- Be concise and clear (no need for excessive detail)
-- For multiple findings, separate with next lines (do not use numbered list or bullet points)
-- If no significant findings at all, only output "Unremarkable ultrasound study."
-- Focus on clinically relevant information (no recommendations or management advice or extraneous details)"""
+- Summarize the most significant findings 
+
+- Be concise
+
+- Do not use your own medical terminology; only use terms provided in the organ reports
+
+- Avoid filler or auxiliary words (e.g., “a,” “is,” “are,” “noted,” “present,” “seen,” “suggestive of”)
+
+- Use short, direct noun phrases or descriptors
+
+- Separate each finding with a new line (no bullets or numbering)
+
+- Focus only on clinically significant findings (Exclude normal findings and previous comparison statements)
+
+- If the entire ultrasound is normal, impression should only be "Unremarkable ultrasound study. """
     
 
 
@@ -538,7 +654,7 @@ class CentralAgent:
         self.others_agent = OthersAgent(api_key)
         self.impression_agent = ImpressionAgent(api_key)
     
-    async def process_patient_async(self, patient_data: str) -> str:
+    async def process_patient_async(self, patient_data: str, ultrasound_type: str = "Abdomen") -> str:
         """Process patient data and generate complete report"""
         print("\n" + "="*80)
         print("PROCESSING PATIENT")
@@ -681,7 +797,7 @@ Provide only the impression text, no headers."""
         )
         
         # Step 5: Create final report
-        final_report = f"""RADIOLOGY REPORT
+        final_report = f"""ULTRASOUND {ultrasound_type.upper()}
 
 {full_report}
 
@@ -714,9 +830,14 @@ class RadiologyReportGenerator:
         start_time = time.time()
         
         tasks = []
+        names = []
         for i, patient_data in enumerate(patient_data_list, 1):
             print(f"  • Queuing Patient {i}/{len(patient_data_list)}")
-            tasks.append(self.central_agent.process_patient_async(patient_data))
+            examination_finding = patient_data.get('examination_finding', '')
+            ultrasound_type = patient_data.get('ultrasound_type', 'Abdomen')
+            name = patient_data.get('name')
+            names.append(name)
+            tasks.append(self.central_agent.process_patient_async(examination_finding, ultrasound_type))
         
         # Execute all patients in parallel
         reports = await asyncio.gather(*tasks)
@@ -728,8 +849,8 @@ class RadiologyReportGenerator:
         # Format reports
         all_reports = []
         for i, report in enumerate(reports, 1):
-            all_reports.append(f"{'='*80}\nPATIENT {i}\n{'='*80}\n\n{report}")
-        
+            all_reports.append(f"{'='*80}\nPATIENT {names[i-1]}\n{'='*80}\n\n{report}")
+
         # Combine all reports
         combined_report = "\n\n\n".join(all_reports)
         
@@ -773,34 +894,48 @@ def main():
     # Initialize generator
     generator = RadiologyReportGenerator(api_key)
         
+    base_folder_path = input("\nEnter the path to the base folder containing date folders: ").strip()
 
-    # Batch mode
-    date = input("\nEnter date (e.g., 2024-01-15): ").strip()
-    num_patients = int(input("How many patients? ").strip())
+    print(f"\nScanning for date folders in: {base_folder_path}")
+    date_findings = process_date_folders(base_folder_path)
     
-    patient_data_list = []
-    for i in range(num_patients):
-        print(f"\n" + "-"*80)
-        print(f"Paste data for PATIENT {i+1} (press Ctrl+D or Ctrl+Z when done):")
-        print("-"*80 + "\n")
-        
-        lines = []
-        try:
-            while True:
-                line = input()
-                lines.append(line)
-        except EOFError:
-            pass
-        
-        patient_data = "\n".join(lines)
-        if patient_data.strip():
-            patient_data_list.append(patient_data)
+    if not date_findings:
+        print("\n❌ No patient data found in any date folders!")
+        return
     
-    if patient_data_list:
-        output_file = generator.process_batch(patient_data_list, date)
-        print(f"\n✓ All reports saved to: {output_file}")
-    else:
-        print("No patient data provided!")
+    # Process each date separately
+    print(f"\n{'='*80}")
+    print(f"PROCESSING {len(date_findings)} DATE(S)")
+    print(f"{'='*80}")
+    
+    all_output_files = []
+    
+    for date, patient_findings in date_findings.items():
+        print(f"\n{'='*80}")
+        print(f"📅 DATE: {date}")
+        print(f"{'='*80}")
+        
+        # Flatten the findings into a list for batch processing
+        patient_data_list = []
+        for name, findings_list in patient_findings.items():
+            print(f"  Patient: {name} - {len(findings_list)} examination(s)")
+            for finding in findings_list:
+                patient_data_list.append(finding)
+        
+        if patient_data_list:
+            print(f"\n  Total examinations for {date}: {len(patient_data_list)}")
+            output_file = generator.process_batch(patient_data_list, date)
+            all_output_files.append(output_file)
+        else:
+            print(f"  ⚠ No valid patient data to process for {date}")
+    
+    # Summary
+    print(f"\n\n{'='*80}")
+    print(f"✅ PROCESSING COMPLETE")
+    print(f"{'='*80}")
+    print(f"Generated {len(all_output_files)} report file(s):")
+    for output_file in all_output_files:
+        print(f"  ✓ {output_file}")
 
 
 if __name__ == "__main__":
