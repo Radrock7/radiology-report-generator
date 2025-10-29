@@ -1,17 +1,255 @@
 """
-Multi-Agent Radiology Report Generator
+Multi-Agent Radiology Report Generator with Google Drive Integration
 A system that uses specialized agents to generate comprehensive radiology reports
+Downloads PDFs from Google Drive, processes them, and cleans up automatically
 """
 
 import json
 import os
 import time
+import shutil
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 import google.generativeai as genai
 import re
 import asyncio
 import pdfquery
+
+# Google Drive API imports
+from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import io
+import pickle
+
+
+
+
+# Google Drive API scopes
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+TEMP_DOWNLOAD_DIR = "./temp_pdfs"  # Temporary directory for downloaded PDFs
+
+
+def authenticate_gdrive():
+    """
+    Authenticate with Google Drive API.
+    Looks for credentials in the following order:
+    1. token.pickle (saved credentials)
+    2. credentials.json (OAuth client credentials)
+    3. service-account.json (Service account credentials)
+    
+    Checks both current directory and /app/credentials (for Docker)
+    """
+    creds = None
+    
+    # Define possible credential paths (for Docker compatibility)
+    credential_dirs = ['.', '/app/credentials']
+    
+    # Helper function to find file in credential directories
+    def find_file(filename):
+        for cred_dir in credential_dirs:
+            filepath = os.path.join(cred_dir, filename)
+            if os.path.exists(filepath):
+                return filepath
+        return None
+    
+    # Check for saved credentials
+    token_path = find_file('token.pickle')
+    if token_path:
+        with open(token_path, 'rb') as token:
+            creds = pickle.load(token)
+    
+    # If no valid credentials, try to authenticate
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            # Try service account first
+            service_account_path = find_file('service-account.json')
+            if service_account_path:
+                print(f"Using service account authentication from: {service_account_path}")
+                creds = service_account.Credentials.from_service_account_file(
+                    service_account_path, scopes=SCOPES)
+            else:
+                # Try OAuth credentials
+                credentials_path = find_file('credentials.json')
+                if credentials_path:
+                    print(f"Using OAuth authentication from: {credentials_path}")
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        credentials_path, SCOPES)
+                    creds = flow.run_local_server(port=0)
+                    # Save credentials for future use
+                    token_save_path = find_file('token.pickle') or 'token.pickle'
+                    with open(token_save_path, 'wb') as token:
+                        pickle.dump(creds, token)
+                else:
+                    raise FileNotFoundError(
+                        "No credentials found! Please provide either:\n"
+                        "1. credentials.json (OAuth) - Download from Google Cloud Console\n"
+                        "2. service-account.json (Service Account) - Download from Google Cloud Console\n"
+                        "Place credentials in ./credentials/ directory or current directory"
+                    )
+    
+    return build('drive', 'v3', credentials=creds)
+
+def find_folder_by_name(service, folder_name, parent_id=None):
+    """Find a folder in Google Drive by name"""
+    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    
+    results = service.files().list(
+        q=query,
+        spaces='drive',
+        fields='files(id, name)'
+    ).execute()
+    
+    items = results.get('files', [])
+    return items[0]['id'] if items else None
+
+
+def list_folders(service, parent_id):
+    """List all folders in a parent folder"""
+    query = f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    
+    results = service.files().list(
+        q=query,
+        spaces='drive',
+        fields='files(id, name)',
+        orderBy='name'
+    ).execute()
+    
+    return results.get('files', [])
+
+
+def list_pdf_files(service, folder_id):
+    """List all PDF files in a folder"""
+    query = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
+    
+    results = service.files().list(
+        q=query,
+        spaces='drive',
+        fields='files(id, name)',
+        orderBy='name'
+    ).execute()
+    
+    return results.get('files', [])
+
+
+def download_file(service, file_id, destination_path):
+    """Download a file from Google Drive"""
+    request = service.files().get_media(fileId=file_id)
+    
+    with open(destination_path, 'wb') as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+    
+    return destination_path
+
+
+def download_pdfs_from_gdrive(service, base_folder_name="patient_data"):
+    """
+    Download all PDFs from Google Drive folder structure:
+    patient_data >> dated folders >> PDFs
+    
+    Returns the local path to the downloaded files
+    """
+    print(f"\n{'='*80}")
+    print(f"CONNECTING TO GOOGLE DRIVE")
+    print(f"{'='*80}")
+    
+    # Find the patient_data folder
+    print(f"\nSearching for folder: {base_folder_name}")
+    base_folder_id = find_folder_by_name(service, base_folder_name)
+    
+    if not base_folder_id:
+        raise FileNotFoundError(f"Folder '{base_folder_name}' not found in Google Drive")
+    
+    print(f"✓ Found '{base_folder_name}' folder")
+    
+    # Create temporary download directory
+    if os.path.exists(TEMP_DOWNLOAD_DIR):
+        shutil.rmtree(TEMP_DOWNLOAD_DIR)
+    os.makedirs(TEMP_DOWNLOAD_DIR)
+    
+    print(f"\nDownloading PDFs to: {TEMP_DOWNLOAD_DIR}")
+    
+    # List all date folders
+    date_folders = list_folders(service, base_folder_id)
+    
+    if not date_folders:
+        print(f"⚠ No date folders found in '{base_folder_name}'")
+        return TEMP_DOWNLOAD_DIR
+    
+    print(f"\nFound {len(date_folders)} date folder(s)")
+    
+    total_files = 0
+    
+    # For each date folder
+    for date_folder in date_folders:
+        date_name = date_folder['name']
+        date_id = date_folder['id']
+        
+        print(f"\n  📅 Processing folder: {date_name}")
+        
+        # Create local date folder
+        local_date_folder = os.path.join(TEMP_DOWNLOAD_DIR, date_name)
+        os.makedirs(local_date_folder, exist_ok=True)
+        
+        # List PDF files in this date folder
+        pdf_files = list_pdf_files(service, date_id)
+        
+        if not pdf_files:
+            print(f"    ⚠ No PDF files found in {date_name}")
+            continue
+        
+        print(f"    Found {len(pdf_files)} PDF file(s)")
+        
+        # Download each PDF
+        for idx, pdf_file in enumerate(pdf_files, 1):
+            file_name = pdf_file['name']
+            file_id = pdf_file['id']
+            
+            destination = os.path.join(local_date_folder, file_name)
+            
+            try:
+                download_file(service, file_id, destination)
+                print(f"    ✓ [{idx}/{len(pdf_files)}] {file_name}")
+                total_files += 1
+            except Exception as e:
+                print(f"    ✗ Error downloading {file_name}: {e}")
+    
+    print(f"\n{'='*80}")
+    print(f"✓ DOWNLOAD COMPLETE")
+    print(f"✓ Total files downloaded: {total_files}")
+    print(f"{'='*80}\n")
+    
+    return TEMP_DOWNLOAD_DIR
+
+
+def cleanup_downloaded_files():
+    """Delete the temporary downloaded PDF files"""
+    if os.path.exists(TEMP_DOWNLOAD_DIR):
+        print(f"\n{'='*80}")
+        print(f"CLEANING UP DOWNLOADED FILES")
+        print(f"{'='*80}")
+        
+        # Count files before deletion
+        file_count = 0
+        for root, dirs, files in os.walk(TEMP_DOWNLOAD_DIR):
+            file_count += len(files)
+        
+        # Delete directory
+        shutil.rmtree(TEMP_DOWNLOAD_DIR)
+        
+        print(f"✓ Deleted {file_count} temporary file(s)")
+        print(f"✓ Removed directory: {TEMP_DOWNLOAD_DIR}")
+        print(f"{'='*80}\n")
 
 
 def extract_number(filename):
@@ -69,7 +307,8 @@ def read_pdfs_in_folder(folder_path):
                 if name in findings:
                     findings[name].append({
                         'examination_finding': examination_finding,
-                        'ultrasound_type': ultrasound_type
+                        'ultrasound_type': ultrasound_type,
+                        'name': name
                     })
                 else:
                     findings[name] = [{
@@ -120,6 +359,7 @@ def process_date_folders(base_folder_path):
             print(f"  ⚠ No valid PDFs found in {date_folder}")
     
     return date_findings
+
 
 @dataclass
 class PatientInfo:
@@ -252,6 +492,8 @@ Return a JSON object with the structure specified in your system prompt."""
         )
 
 
+
+
 class LiverAgent(BaseAgent):
     """Specialized agent for liver imaging"""
     
@@ -311,19 +553,16 @@ Your job: **generate a short, precise liver ultrasound report (1–4 sentences)*
 
 --- FINAL INSTRUCTION (must be followed exactly)
 When you receive the structured input, produce **only** the liver report paragraph(s) adhering to the rules above. **Do not output anything else** — no commentary, no bullet lists, no extra whitespace lines, and no surrounding quotes.
-
 """
 
 
-
-
-class GallbladderAgent(BaseAgent):
-    """Specialized agent for gallbladder and biliary system imaging"""
+class GBAgent(BaseAgent):
+    """Specialized agent for gallbladder imaging"""
     
     def __init__(self, api_key: str):
         super().__init__(api_key)
-        self.organ_name = "Gallbladder and Biliary System"
-        self.system_prompt = """You are the Gallbladder Ultrasound Report Agent.Your job: generate a concise gallbladder & biliary ultrasound report (1–4 sentences) from structured findings. Output only the report text — no headings, no metadata, no explanations, and no extra commentary.
+        self.organ_name = "Gallbladder"
+        self.system_prompt = """ou are the Gallbladder Ultrasound Report Agent.Your job: generate a concise gallbladder & biliary ultrasound report (1–4 sentences) from structured findings. Output only the report text — no headings, no metadata, no explanations, and no extra commentary.
 --- INPUT FORMAT:
 * Global tags (zero or more): Dilated RAS (+), NP, Post Cholecystectomy, Multiple stones, Stones, Polyp(s), Sludge, etc.
 * Lesion list (zero or more). Each lesion entry includes: type (e.g. Stone, Polyp, RAS), location/segment if applicable (e.g. fundus), and measurement(s) in mm (e.g. 18.2 mm, 8.5 x 7.7 mm, 2.5 mm). May include qualifiers: max, largest, with septation, not well visualized, previously reported, reported previously.
@@ -362,7 +601,6 @@ class GallbladderAgent(BaseAgent):
 --- FINAL INSTRUCTION (must be followed exactly)When you receive the structured input, produce only the gallbladder and biliary report paragraph(s) following the rules above. Do not output anything else — no commentary, no bullet lists, no extra whitespace lines, and no surrounding quotes.
 
 """
-
 
 
 class PancreasAgent(BaseAgent):
@@ -445,8 +683,6 @@ class SpleenAgent(BaseAgent):
 When you receive the structured input, produce only the spleen report paragraph(s) adhering to the rules above. Do not output anything else — no commentary, no bullet lists, no extra whitespace lines, and no surrounding quotes.
 """
 
-
-
 class KidneyAgent(BaseAgent):
     """Specialized agent for kidney imaging"""
     
@@ -501,7 +737,6 @@ IMPORTANT: MP in input must be reported as "interpolar region" — do not output
 When you receive the structured input, produce only the kidney report paragraph(s) adhering to the rules above. Do not output anything else — no commentary, no bullet lists, no extra whitespace lines, and no surrounding quotes."""
 
 
-
 class AortaAgent(BaseAgent):
     """Specialized agent for aorta imaging"""
     
@@ -551,10 +786,11 @@ When you receive the structured input, produce only the abdominal aorta report p
 
 
 class OthersAgent(BaseAgent):
-    """Agent for non-standard organs"""
+    """Specialized agent for other organs"""
     
     def __init__(self, api_key: str):
         super().__init__(api_key)
+        self.organ_name = "Other Organs"
         self.system_prompt = """You are a radiologist generating reports for various organs.
 Generate professional, concise radiology report sections.
 
@@ -611,8 +847,9 @@ When you receive the structured input, produce only the report paragraph(s) for 
 """
 
 
+
 class ImpressionAgent(BaseAgent):
-    """Agent that generates the impression/summary"""
+    """Agent that generates the IMPRESSION section"""
     
     def __init__(self, api_key: str):
         super().__init__(api_key)
@@ -637,16 +874,15 @@ The impression should:
     
 
 
+
+
 class CentralAgent:
-    """Central orchestrator that coordinates all agents"""
+    """Central coordinator that manages all specialized agents"""
     
     def __init__(self, api_key: str):
-        self.api_key = api_key
         self.splitter = SplitterAgent(api_key)
-        
-        # Initialize individual specialized organ agents
         self.liver_agent = LiverAgent(api_key)
-        self.gb_agent = GallbladderAgent(api_key)
+        self.gb_agent = GBAgent(api_key)
         self.pancreas_agent = PancreasAgent(api_key)
         self.spleen_agent = SpleenAgent(api_key)
         self.kidney_agent = KidneyAgent(api_key)
@@ -655,19 +891,13 @@ class CentralAgent:
         self.impression_agent = ImpressionAgent(api_key)
     
     async def process_patient_async(self, patient_data: str, ultrasound_type: str = "Abdomen") -> str:
-        """Process patient data and generate complete report"""
-        print("\n" + "="*80)
-        print("PROCESSING PATIENT")
-        print("="*80)
-        
-        # Step 1: Split data by body part
+        """Process a single patient's data asynchronously"""
+        # Step 1: Split patient data
         print("\n[1] Splitting patient data by body part...")
         patient_info = await self.splitter.split(patient_data)
-        print(f"✓ Data extracted for: Liver, GB, Pancreas, Spleen, Kidney, Aorta, Others, Comment")
         
-        # Step 2: Generate reports for each organ in order
-        print("\n[2] Generating organ-specific reports PARALLELLY...")
-        
+        # Step 2: Generate reports for each organ in parallel
+        print("\n[2] Generating individual organ reports...")
         tasks = []
         
         # Liver
@@ -680,13 +910,13 @@ class CentralAgent:
 Provide only the report text, no headers or labels."""
             tasks.append(self.liver_agent.generate_response_async(
                 prompt,
-                self.liver_agent.system_prompt 
+                self.liver_agent.system_prompt
             ))
         
-        # Gallbladder
+        # GB
         if patient_info.gb and patient_info.gb.strip():
-            print("  → Generating Gallbladder report...")
-            prompt = f"""Generate a radiology report section for the gallbladder and biliary system based on these findings:
+            print("  → Generating GB report...")
+            prompt = f"""Generate a radiology report section for the gallbladder and CBD based on these findings:
 
 {patient_info.gb}
 
@@ -695,11 +925,11 @@ Provide only the report text, no headers or labels."""
                 prompt,
                 self.gb_agent.system_prompt
             ))
-
+        
         # Pancreas
         if patient_info.pancreas and patient_info.pancreas.strip():
             print("  → Generating Pancreas report...")
-            prompt = f"""Generate a radiology report section for the pancreas based on these findings:
+            prompt = f"""Generate a radiology report section for the pancreas and MPD based on these findings:
 
 {patient_info.pancreas}
 
@@ -708,7 +938,7 @@ Provide only the report text, no headers or labels."""
                 prompt,
                 self.pancreas_agent.system_prompt
             ))
-
+        
         # Spleen
         if patient_info.spleen and patient_info.spleen.strip():
             print("  → Generating Spleen report...")
@@ -721,8 +951,8 @@ Provide only the report text, no headers or labels."""
                 prompt,
                 self.spleen_agent.system_prompt
             ))
-
-        # Kidneys
+        
+        # Kidney
         if patient_info.kidney and patient_info.kidney.strip():
             print("  → Generating Kidney report...")
             prompt = f"""Generate a radiology report section for the kidneys based on these findings:
@@ -811,6 +1041,8 @@ IMPRESSION:
         return final_report
 
 
+
+
 class RadiologyReportGenerator:
     """Main application class"""
     
@@ -818,7 +1050,7 @@ class RadiologyReportGenerator:
         self.central_agent = CentralAgent(api_key)
         self.output_dir = "./output/"
     
-    async def process_batch_async(self, patient_data_list: List[str], date: str) -> str:
+    async def process_batch_async(self, patient_data_list: List[Dict], date: str) -> str:
         """Process multiple patients concurrently (FAST!)"""
         print(f"\n{'='*80}")
         print(f"PROCESSING BATCH FOR DATE: {date} (ASYNC MODE)")
@@ -850,7 +1082,7 @@ class RadiologyReportGenerator:
         all_reports = []
         for i, report in enumerate(reports, 1):
             all_reports.append(f"{'='*80}\nPATIENT {names[i-1]}\n{'='*80}\n\n{report}")
-
+        
         # Combine all reports
         combined_report = "\n\n\n".join(all_reports)
         
@@ -869,18 +1101,20 @@ class RadiologyReportGenerator:
         
         return output_file
     
-    def process_batch(self, patient_data_list: List[str], date: str) -> str:
+    def process_batch(self, patient_data_list: List[Dict], date: str) -> str:
         """Process multiple patients for a specific date (sync wrapper)"""
         return asyncio.run(self.process_batch_async(patient_data_list, date))
 
 
 
+
 def main():
-    """Main entry point for testing"""
+    """Main entry point"""
     print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║      MULTI-AGENT RADIOLOGY REPORT GENERATOR                  ║
 ║      Powered by Gemini 2.0 Flash                             ║
+║      with Google Drive Integration                           ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
     
@@ -891,51 +1125,71 @@ def main():
         print("Please set your API key: export GOOGLE_API_KEY='your-key-here'")
         return
     
-    # Initialize generator
-    generator = RadiologyReportGenerator(api_key)
+    try:
+        # Authenticate with Google Drive
+        print("\nAuthenticating with Google Drive...")
+        service = authenticate_gdrive()
+        print("✓ Authentication successful!\n")
         
-    base_folder_path = input("\nEnter the path to the base folder containing date folders: ").strip()
-
-    print(f"\nScanning for date folders in: {base_folder_path}")
-    date_findings = process_date_folders(base_folder_path)
-    
-    if not date_findings:
-        print("\n❌ No patient data found in any date folders!")
-        return
-    
-    # Process each date separately
-    print(f"\n{'='*80}")
-    print(f"PROCESSING {len(date_findings)} DATE(S)")
-    print(f"{'='*80}")
-    
-    all_output_files = []
-    
-    for date, patient_findings in date_findings.items():
+        # Download PDFs from Google Drive
+        base_folder_path = download_pdfs_from_gdrive(service, "patient_data")
+        
+        # Initialize generator
+        generator = RadiologyReportGenerator(api_key)
+        
+        # Process the downloaded PDFs
         print(f"\n{'='*80}")
-        print(f"📅 DATE: {date}")
+        print(f"PROCESSING DOWNLOADED PDFs")
         print(f"{'='*80}")
         
-        # Flatten the findings into a list for batch processing
-        patient_data_list = []
-        for name, findings_list in patient_findings.items():
-            print(f"  Patient: {name} - {len(findings_list)} examination(s)")
-            for finding in findings_list:
-                patient_data_list.append(finding)
+        date_findings = process_date_folders(base_folder_path)
         
-        if patient_data_list:
-            print(f"\n  Total examinations for {date}: {len(patient_data_list)}")
-            output_file = generator.process_batch(patient_data_list, date)
-            all_output_files.append(output_file)
-        else:
-            print(f"  ⚠ No valid patient data to process for {date}")
+        if not date_findings:
+            print("\n❌ No patient data found in any date folders!")
+            return
+        
+        # Process each date separately
+        print(f"\n{'='*80}")
+        print(f"GENERATING REPORTS FOR {len(date_findings)} DATE(S)")
+        print(f"{'='*80}")
+        
+        all_output_files = []
+        
+        for date, patient_findings in date_findings.items():
+            print(f"\n{'='*80}")
+            print(f"📅 DATE: {date}")
+            print(f"{'='*80}")
+            
+            # Flatten the findings into a list for batch processing
+            patient_data_list = []
+            for name, findings_list in patient_findings.items():
+                print(f"  Patient: {name} - {len(findings_list)} examination(s)")
+                for finding in findings_list:
+                    patient_data_list.append(finding)
+            
+            if patient_data_list:
+                print(f"\n  Total examinations for {date}: {len(patient_data_list)}")
+                output_file = generator.process_batch(patient_data_list, date)
+                all_output_files.append(output_file)
+            else:
+                print(f"  ⚠ No valid patient data to process for {date}")
+        
+        # Summary
+        print(f"\n\n{'='*80}")
+        print(f"✅ REPORT GENERATION COMPLETE")
+        print(f"{'='*80}")
+        print(f"Generated {len(all_output_files)} report file(s):")
+        for output_file in all_output_files:
+            print(f"  ✓ {output_file}")
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        return
     
-    # Summary
-    print(f"\n\n{'='*80}")
-    print(f"✅ PROCESSING COMPLETE")
-    print(f"{'='*80}")
-    print(f"Generated {len(all_output_files)} report file(s):")
-    for output_file in all_output_files:
-        print(f"  ✓ {output_file}")
+    finally:
+        # Clean up downloaded files
+        cleanup_downloaded_files()
+        print("\n✅ All operations completed!")
 
 
 if __name__ == "__main__":

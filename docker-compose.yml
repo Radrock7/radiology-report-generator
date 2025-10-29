@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  radiology-report-generator:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    image: radiology-report-generator:latest
+    container_name: radiology-reports
+    
+    # Environment variables
+    environment:
+      # Gemini API Key (required) - set in .env file
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    
+    # Volume mounts
+    volumes:
+      # Google Drive API credentials (read-only)
+      # Place credentials.json or service-account.json in ./credentials/
+      - ./credentials:/app/credentials:ro
+      
+      # Output directory for generated reports (read-write)
+      - ./output:/app/output
+      
+      # Optional: OAuth token persistence (uncomment if using OAuth)
+      # - ./token.pickle:/app/token.pickle:rw
+    
+    # Working directory inside container
+    working_dir: /app
+    
+    # Command to run
+    command: python radiology_report_generator.py
+    
+    # Restart policy (optional)
+    # restart: unless-stopped
+    
+    # Logging configuration (optional)
+    # logging:
+    #   driver: "json-file"
+    #   options:
+    #     max-size: "10m"
+    #     max-file: "3"
