@@ -441,43 +441,145 @@ class BaseAgent:
 
 
 class SplitterAgent(BaseAgent):
-    """Agent that splits patient information by body part"""
+    """Agent that splits patient information by body part using structured output"""
     
     def __init__(self, api_key: str):
         super().__init__(api_key)
-        self.system_prompt = """You are a medical data extraction specialist. Your job is to parse radiology patient information and extract data for different body parts.
+        
+        # Define the structured output schema
+        self.response_schema = {
+            "type": "object",
+            "properties": {
+                "liver": {
+                    "type": "string",
+                    "description": "Liver findings"
+                },
+                "gb": {
+                    "type": "string",
+                    "description": "Gall bladder and CBD findings"
+                },
+                "pancreas": {
+                    "type": "string",
+                    "description": "Pancreas and MPD findings"
+                },
+                "spleen": {
+                    "type": "string",
+                    "description": "Spleen findings"
+                },
+                "kidney": {
+                    "type": "string",
+                    "description": "Kidney findings"
+                },
+                "aorta": {
+                    "type": "string",
+                    "description": "Aorta findings"
+                },
+                "others": {
+                    "type": "array",
+                    "description": "Other organs not in standard list",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "organ": {
+                                "type": "string",
+                                "description": "Organ name"
+                            },
+                            "findings": {
+                                "type": "string",
+                                "description": "Findings for this organ"
+                            }
+                        },
+                        "required": ["organ", "findings"]
+                    }
+                },
+                "comment": {
+                    "type": "string",
+                    "description": "Additional comments"
+                }
+            },
+            "required": ["liver", "gb", "pancreas", "spleen", "kidney", "aorta", "others", "comment"]
+        }
+        
+        self.system_prompt = """You are a medical data extraction specialist. Extract information from radiology patient reports and organize by body part.
 
-Extract information for these categories in order:
+Extract information for these categories:
 1. Liver
 2. GB (Gall Bladder) - includes CBD
 3. Pancreas - includes MPD
 4. Spleen
 5. Kidney
 6. Aorta
-7. Others - any organs not in the standard list above
-8. Comment
+7. Others - any organs not in the standard list above (return as array of objects)
+8. Comment - any additional notes
 
-Return ONLY a valid JSON object with these keys: liver, gb, pancreas, spleen, kidney, aorta, others, comment
-For "others", return a list of objects with "organ" and "findings" keys.
+For "others", create an array of objects with "organ" and "findings" keys.
 If a section says "NP" or is empty, include it as is.
 Preserve all measurements and details exactly as written."""
     
     async def split(self, patient_data: str) -> PatientInfo:
-        """Split patient data into structured format"""
+        """Split patient data into structured format using structured output"""
+        
+        # Check if patient_data is empty
+        if not patient_data or not patient_data.strip():
+            print("⚠️  WARNING: Empty patient data received")
+            return PatientInfo()
+        
         prompt = f"""Parse this radiology patient information and extract data by body part:
 
 {patient_data}
 
-Return a JSON object with the structure specified in your system prompt."""
+Extract the information according to the schema."""
         
-        response = await self.generate_response_async(prompt, self.system_prompt)
-        
-        # Extract JSON from response
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group())
-        else:
-            data = json.loads(response)
+        try:
+            # Use structured output for guaranteed JSON response
+            response = await asyncio.to_thread(
+                self.model.generate_content,
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    temperature=0,
+                    max_output_tokens=5000,
+                    response_mime_type="application/json",
+                    response_schema=self.response_schema
+                )
+            )
+            
+            # Parse the guaranteed JSON response
+            data = json.loads(response.text)
+            
+            print(f"✓ Successfully parsed patient data structure")
+            
+        except json.JSONDecodeError as e:
+            print(f"❌ ERROR: Failed to parse JSON response")
+            print(f"   Error: {e}")
+            print(f"   Response preview: {response.text[:200] if response and response.text else 'No response'}")
+            return PatientInfo()
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # Handle rate limiting
+            if '429' in error_str or 'quota' in error_str or 'rate limit' in error_str:
+                print(f"⚠️  Rate limit hit during patient data splitting. Retrying...")
+                await asyncio.sleep(2)
+                # Retry once
+                try:
+                    response = await asyncio.to_thread(
+                        self.model.generate_content,
+                        prompt,
+                        generation_config=genai.GenerationConfig(
+                            temperature=0,
+                            max_output_tokens=5000,
+                            response_mime_type="application/json",
+                            response_schema=self.response_schema
+                        )
+                    )
+                    data = json.loads(response.text)
+                except Exception as retry_error:
+                    print(f"❌ ERROR: Retry failed - {retry_error}")
+                    return PatientInfo()
+            else:
+                print(f"❌ ERROR: {e}")
+                return PatientInfo()
         
         # Convert to PatientInfo object
         return PatientInfo(
