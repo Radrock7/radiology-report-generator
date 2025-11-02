@@ -860,11 +860,11 @@ class AortaAgent(BaseAgent):
 --- PHRASES & WORDING (use these concise or equivalent phrases)
 * Normal aorta: “The abdominal aorta is normal, with no visible calcified plaque.”
 * Single plaque: “An abdominal aortic plaque is present, measuring A x B mm.”
-* Multiple plaques: “There are multiple plaques in the abdominal aorta, measuring A x B mm, C x D mm, and E x F mm.” or “Multiple plaques are present, largest measuring A x B mm.”
+* Multiple plaques: “There are multiple aortic plaques in the abdominal aorta, measuring A x B mm, C x D mm, and E x F mm.” or “Multiple aortic plaques are present, largest measuring A x B mm.”
 * Calcified plaque: append “calcified” if specified: “A calcified abdominal aortic plaque is present, measuring A x B mm.”
 * Aortic diameter: “The abdominal aortic diameter measures X mm.”
 * Aneurysm: “Abdominal aortic aneurysm measuring X mm.”
-* Previously reported plaque absent/unchanged: “The previously reported plaque is not visualized in this study.” / “The previously reported plaque is unchanged.”
+* Previously reported plaque absent/unchanged: “The previously reported aorticplaque is not visualized in this study.” / “The previously reported aortic plaque is unchanged.”
 --- MEASUREMENT FORMAT
 * Two-dimensional: A x B mm (preserve decimal precision as provided).
 * Single-dimension: N mm.
@@ -878,7 +878,7 @@ class AortaAgent(BaseAgent):
 * Keep sentences objective and avoid management recommendations or clinical guidance.
 --- EDGE CASES
 * Plaque measurements only: “An abdominal aortic plaque is present, measuring 15.9 x 3.7 mm.”
-* Multiple small plaques: “There are multiple plaques in the abdominal aorta, measuring 5.3 x 1.5 mm, 5.1 x 1.6 mm and 6.0 x 2.1 mm.”
+* Multiple small plaques: “There are multiple. plaques in the abdominal aorta, measuring 5.3 x 1.5 mm, 5.1 x 1.6 mm and 6.0 x 2.1 mm.”
 * Aorta normal but prior plaque absent on comparison: “The abdominal aorta is normal, with no visible calcified plaque. The previously reported plaque is not visualized in this study.”
 * Diameter present without plaque: include normal/abnormal sentence then “The abdominal aortic diameter measures X mm.”
 * If location given for plaques, include it: “A plaque is present in the infrarenal aorta, measuring A x B mm.”
